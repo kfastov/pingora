@@ -33,12 +33,33 @@ use crate::services::Service as ServiceTrait;
 
 use async_trait::async_trait;
 use log::{debug, error, info};
+use once_cell::sync::Lazy;
 use pingora_error::Result;
 use pingora_runtime::current_handle;
 use pingora_timeout::timeout;
 use std::fs::Permissions;
 use std::sync::Arc;
 use std::time::Duration;
+
+// Fork: configurable handshake timeout; drop with upstream accept_limits (5104a3e036).
+/// Downstream handshake timeout from `PINGORA_HANDSHAKE_TIMEOUT_SECS`, read once.
+static HANDSHAKE_TIMEOUT: Lazy<Duration> = Lazy::new(|| {
+    let value = std::env::var("PINGORA_HANDSHAKE_TIMEOUT_SECS").ok();
+    let handshake_timeout = parse_handshake_timeout(value.as_deref());
+    info!(
+        "Downstream handshake timeout {}s",
+        handshake_timeout.as_secs()
+    );
+    handshake_timeout
+});
+
+/// Unset, empty, zero or unparsable keeps the upstream 60 s.
+fn parse_handshake_timeout(value: Option<&str>) -> Duration {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .map_or(Duration::from_secs(60), Duration::from_secs)
+}
 
 /// The type of service that is associated with a list of listening endpoints and a particular application
 pub struct Service<A> {
@@ -186,6 +207,7 @@ impl<A: ServerApp + Send + Sync + 'static> Service<A> {
         mut stack: TransportStack,
         mut shutdown: ShutdownWatch,
     ) {
+        let handshake_timeout = *HANDSHAKE_TIMEOUT;
         // the accept loop, until the system is shutting down
         loop {
             let new_io = tokio::select! { // TODO: consider biased for perf reason?
@@ -213,7 +235,7 @@ impl<A: ServerApp + Send + Sync + 'static> Service<A> {
                     let shutdown = shutdown.clone();
                     current_handle().spawn(async move {
                         let peer_addr = io.peer_addr();
-                        match timeout(Duration::from_secs(60), io.handshake()).await {
+                        match timeout(handshake_timeout, io.handshake()).await {
                             Ok(handshake) => {
                                 match handshake {
                                     Ok(io) => Self::handle_event(io, app, shutdown).await,
@@ -321,5 +343,27 @@ impl Service<PrometheusServer> {
             "Prometheus metric HTTP".to_string(),
             PrometheusServer::new(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_handshake_timeout_from_env_value() {
+        assert_eq!(parse_handshake_timeout(Some("10")), Duration::from_secs(10));
+        assert_eq!(parse_handshake_timeout(Some(" 5 ")), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_handshake_timeout_keeps_upstream_default() {
+        for value in [None, Some(""), Some("0"), Some("-1"), Some("ten")] {
+            assert_eq!(
+                parse_handshake_timeout(value),
+                Duration::from_secs(60),
+                "{value:?}"
+            );
+        }
     }
 }
